@@ -5,8 +5,10 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   Index,
+  OneToMany,
 } from 'typeorm';
 import { UserRole } from '../../../common/constants/roles';
+import { Session } from '../../auth/entities/session.entity';
 
 export { UserRole };
 
@@ -26,7 +28,7 @@ export class User {
   @Index()
   email: string;
 
-  @Column({ nullable: true })
+  @Column({'not null': true})
   username: string;
 
   @Column()
@@ -38,11 +40,11 @@ export class User {
   @Column({ select: false })
   password: string;
 
-  @Column({ nullable: true })
-  phone: string;
+  @Column({ type: 'varchar', nullable: true })
+  phone: string | null;
 
-  @Column({ nullable: true })
-  profilePicture: string;
+  @Column({ type: 'varchar', nullable: true })
+  profilePicture: string | null;
 
   @Column({
     type: 'enum',
@@ -60,47 +62,50 @@ export class User {
 
   @Column({ nullable: true, unique: true })
   @Index()
-  stellarPublicKey: string;
+  stellarPublicKey: string | null;
 
   @Column({ default: false })
   isEmailVerified: boolean;
 
-  @Column({ nullable: true })
-  emailVerificationToken: string;
+  @Column({ type: 'varchar', nullable: true })
+  emailVerificationToken: string | null;
 
   @Column({ type: 'timestamp', nullable: true })
-  emailVerificationExpires: Date;
+  emailVerificationExpires: Date | null;
 
-  @Column({ nullable: true })
-  passwordResetToken: string;
+  @Column({ type: 'varchar', nullable: true })
+  passwordResetToken: string | null;
 
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   @Index()
-  passwordResetTokenHash: string;
+  passwordResetTokenHash: string | null;
 
   @Column({ type: 'timestamp', nullable: true })
-  passwordResetExpires: Date;
+  passwordResetExpires: Date | null;
 
   @Column({ default: true })
   isActive: boolean;
 
   @Column({ type: 'jsonb', nullable: true })
-  metadata: Record<string, any>;
+  metadata: Record<string, any> | null;
 
   @Column({ default: 0 })
   loginAttempts: number;
 
   @Column({ type: 'timestamp', nullable: true })
-  lastLoginAt: Date;
+  lastLoginAt: Date | null;
 
   @Column({ type: 'timestamp', nullable: true })
-  lockedUntil: Date;
+  lockedUntil: Date | null;
 
   @Column({ type: 'varchar', nullable: true })
   refreshToken: string | null;
 
   @Column({ type: 'timestamp', nullable: true })
   refreshTokenExpires: Date | null;
+
+  @Column({ default: 0 })
+  tokenVersion: number;
 
   @Column({ default: false })
   twoFactorEnabled: boolean;
@@ -110,6 +115,9 @@ export class User {
 
   @Column({ type: 'simple-array', nullable: true, select: false })
   twoFactorBackupCodes: string[] | null;
+
+  @OneToMany(() => Session, (session) => session.user)
+  sessions: Session[];
 
   @CreateDateColumn()
   createdAt: Date;

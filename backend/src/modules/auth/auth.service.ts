@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Logger,
   UnauthorizedException,
   ForbiddenException,
 } from '@nestjs/common';
@@ -13,17 +14,21 @@ import { LogoutDto } from './dto/logout.dto';
 import { LogoutResponseDto } from './dto/logout-response.dto';
 import { JwtManagementService } from './services/jwt.service';
 import { TwoFactorService } from './services/two-factor.service';
+import { SessionService } from './services/session.service';
 import { UserStatus } from '../users/entities/user.entity';
 import * as bcrypt from 'bcryptjs';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly usersService: UsersService,
     private readonly jwtService: JwtService,
     private readonly jwtManagementService: JwtManagementService,
     private readonly twoFactorService: TwoFactorService,
     private readonly userRepository: UserRepository,
+    private readonly sessionService: SessionService,
   ) {}
 
   async validateUser(email: string, pass: string): Promise<any> {
@@ -45,7 +50,9 @@ export class AuthService {
 
   async login(
     loginDto: LoginDto,
-  ): Promise<AuthResponseDto & { requires2FA?: boolean; preAuthToken?: string }> {
+  ): Promise<
+    AuthResponseDto & { requires2FA?: boolean; preAuthToken?: string }
+  > {
     const user = await this.validateUser(loginDto.email, loginDto.password);
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');
@@ -68,15 +75,25 @@ export class AuthService {
       return { requires2FA: true, preAuthToken } as any;
     }
 
-    const payload = { email: user.email, sub: user.id, role: user.role };
-    const accessToken = await this.jwtManagementService.generateAccessToken(payload);
-    const refreshToken = await this.jwtManagementService.generateRefreshToken(payload);
+    const payload = {
+      email: user.email,
+      sub: user.id,
+      role: user.role,
+      tokenVersion: user.tokenVersion ?? 0,
+    };
+    const accessToken =
+      await this.jwtManagementService.generateAccessToken(payload);
+    const refreshToken =
+      await this.jwtManagementService.generateRefreshToken(payload);
 
     // Update the refresh token in the database
     const hashedRefreshToken = await bcrypt.hash(refreshToken, 12);
     await this.userRepository.update(user.id, {
       refreshToken: hashedRefreshToken,
     });
+
+    // Record the session so it can be listed and revoked later
+    await this.sessionService.createSession(user.id, hashedRefreshToken);
 
     return {
       accessToken,
@@ -108,7 +125,39 @@ export class AuthService {
       throw new UnauthorizedException('Invalid token type');
     }
 
-    await this.twoFactorService.validateLogin(payload.sub, token);
+    if (this.jwtManagementService?.isTokenBlacklisted) {
+      const isBlacklisted =
+        await this.jwtManagementService.isTokenBlacklisted(preAuthToken);
+      if (isBlacklisted) {
+        throw new UnauthorizedException('Invalid or expired pre-auth token');
+      }
+    }
+
+    try {
+      await this.twoFactorService.validateLogin(payload.sub, token);
+    } catch (err) {
+      if (this.jwtManagementService?.recordFailed2faAttempt) {
+        const { invalidated } =
+          await this.jwtManagementService.recordFailed2faAttempt(
+            preAuthToken,
+            3,
+          );
+        if (invalidated) {
+          throw new UnauthorizedException(
+            'Too many failed 2FA attempts. Pre-auth token has been invalidated.',
+          );
+        }
+      }
+      throw err;
+    }
+
+    // Invalidate pre-auth token so it cannot be reused
+    if (this.jwtManagementService?.blacklistToken) {
+      await this.jwtManagementService.blacklistToken(preAuthToken, 5 * 60);
+    }
+    if (this.jwtManagementService?.clear2faAttempts) {
+      await this.jwtManagementService.clear2faAttempts(preAuthToken);
+    }
 
     const user = await this.usersService.findOneById(payload.sub);
     if (!user || !user.isActive) {
@@ -119,15 +168,20 @@ export class AuthService {
       email: user.email,
       sub: user.id,
       role: user.role,
+      tokenVersion: user.tokenVersion ?? 0,
     };
-    const accessToken = await this.jwtManagementService.generateAccessToken(payloadForToken);
-    const refreshToken = await this.jwtManagementService.generateRefreshToken(payloadForToken);
+    const accessToken =
+      await this.jwtManagementService.generateAccessToken(payloadForToken);
+    const refreshToken =
+      await this.jwtManagementService.generateRefreshToken(payloadForToken);
 
     // Update the refresh token in the database
     const hashedRefreshToken = await bcrypt.hash(refreshToken, 12);
     await this.userRepository.update(user.id, {
       refreshToken: hashedRefreshToken,
     });
+
+    await this.sessionService.createSession(user.id, hashedRefreshToken);
 
     return {
       accessToken,
@@ -178,10 +232,16 @@ export class AuthService {
       await this.jwtManagementService.blacklistToken(logoutDto.accessToken);
     }
 
-    // Optionally invalidate refresh token stored in database
+    // Clear the stored refresh token. This has to be null, not undefined:
+    // TypeORM's update() skips undefined fields entirely, so the previous
+    // version wrote nothing at all and the refresh cookie kept minting new
+    // access tokens after logout - the session never actually ended.
     await this.userRepository.update(user.id, {
-      refreshToken: undefined,
+      refreshToken: null,
     });
+
+    // End the current session record as well
+    await this.sessionService.revokeSessionByToken(user.id, logoutDto.refreshToken);
 
     return {
       message: 'Successfully logged out',
@@ -216,10 +276,13 @@ export class AuthService {
         await this.jwtManagementService.refreshAccessToken(refreshToken);
 
       // Update the refresh token in the database
-      const hashedRefreshToken = await bcrypt.hash(tokens.refreshToken, 12);
+      const hashedRefreshToken = await bcrypt.hash(tokens.refrshToken ?? '', 12);
       await this.userRepository.update(user.id, {
         refreshToken: hashedRefreshToken,
       });
+
+      // Rotate the session record's hashed refresh token
+      await this.sessionService.rotateToken(user.id, hashedRefreshToken);
 
       return {
         accessToken: tokens.accessToken,
@@ -235,7 +298,30 @@ export class AuthService {
         },
       };
     } catch (error) {
+      // Re-raise the specific reasons untouched; a blanket rewrite here used to
+      // turn every internal fault - a bad secret, a Redis outage during the
+      // blacklist check - into an indistinguishable 401, which made a broken
+      // refresh path impossible to diagnose from the outside.
+      if (error instanceof UnauthorizedException) {
+        throw error;
+      }
+      this.logger.warn(
+        `Refresh token rejected: ${error instanceof Error ? error.message : String(error)}`,
+      );
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
+  }
+
+  async listSessions(userId: string) {
+    return this.sessionService.listSessions(userId);
+  }
+
+  async revokeSession(userId: string, sessionId: string) {
+    return this.sessionService.revokeSession(userId, sessionId);
+  }
+
+  async revokeAllSessions(userId: string) {
+    await this.userRepository.update(userId, { refreshToken: null });
+    return this.sessionService.revokeAllSessions(userId);
   }
 }

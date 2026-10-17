@@ -6,6 +6,7 @@ import { Reflector } from '@nestjs/core';
 import { AuthException } from '../exceptions';
 import { ErrorCode } from '../constants/error-codes';
 import { Request } from 'express';
+import { PrismaService } from '../../prisma/prisma.service';
 
 /**
  * Canonical shape attached to `req.user` by JwtAuthGuard.
@@ -18,6 +19,7 @@ export interface AuthenticatedUser {
   sub: string;
   email: string;
   role: string;
+  tokenVersion?: number;
 }
 
 interface RequestWithUser extends Request {
@@ -34,9 +36,10 @@ export class JwtAuthGuard implements CanActivate {
     private jwtService: JwtService,
     private reflector: Reflector,
     private configService: ConfigService,
+    private prisma: PrismaService,
   ) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     // Check if the route is public
     const isPublic = this.reflector.getAllAndOverride<boolean>(PUBLIC_KEY, [
       context.getHandler(),
@@ -57,6 +60,7 @@ export class JwtAuthGuard implements CanActivate {
       );
     }
 
+    let payload: any;
     try {
       const secret = this.configService.get<string>('JWT_ACCESS_SECRET');
 
@@ -67,23 +71,49 @@ export class JwtAuthGuard implements CanActivate {
         );
       }
 
-      const payload = this.jwtService.verify(token, {
+      payload = this.jwtService.verify(token, {
         secret,
       });
-      // Single canonical req.user shape: id and sub are aliases of the same
-      // user id, so @CurrentUser('id') and @CurrentUser('sub') both resolve.
-      request.user = {
-        id: payload.sub,
-        sub: payload.sub,
-        email: payload.email,
-        role: payload.role,
-      };
     } catch (error: unknown) {
+      if (error instanceof AuthException) {
+        throw error;
+      }
       if (error instanceof Error && error.name === 'TokenExpiredError') {
         throw new AuthException(ErrorCode.TOKEN_EXPIRED, 'Token has expired');
       }
       throw new AuthException(ErrorCode.TOKEN_INVALID, 'Invalid token');
     }
+
+    // Verify the token version against the current user record so that
+    // password changes and "sign out everywhere" revoke outstanding access
+    // tokens.
+    const tokenVersion = typeof payload.tokenVersion === 'number' ? payload.tokenVersion : 0;
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+      select: { id: true, email: true, role: true, tokenVersion: true },
+    });
+
+    if (!user) {
+      throw new AuthException(ErrorCode.TOKEN_INVALID, 'Invalid token');
+    }
+
+    if ((user.tokenVersion ?? 0) !== tokenVersion) {
+      throw new AuthException(
+        ErrorCode.TOKEN_INVALID,
+        'Token has been revoked',
+      );
+    }
+
+    // Single canonical req.user shape: id and sub are aliases of the same
+    // user id, so @CurrentUser('id') and @CurrentUser('sub') both resolve.
+    request.user = {
+      id: user.id,
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      tokenVersion: user.tokenVersion ?? 0,
+    };
 
     return true;
   }

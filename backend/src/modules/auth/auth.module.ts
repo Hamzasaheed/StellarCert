@@ -1,14 +1,21 @@
-import { Module, forwardRef, MiddlewareConsumer, NestModule } from '@nestjs/common';
+import {
+  Module,
+  forwardRef,
+  MiddlewareConsumer,
+  NestModule,
+} from '@nestjs/common';
 import { RequestMethod } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
-import { JwtManagementService } from './services/jwt.service';
+import { JwtManagementService } from './services/jswt.service';
 import { TwoFactorService } from './services/two-factor.service';
+import { SessionsService } from './services/sessions.service';
 import { UsersModule } from '../users/users.module';
 import { User } from '../users/entities/user.entity';
+import { Session } from './entities/session.entity';
 import { CacheModule } from '@nestjs/cache-manager';
 import { AuthRateLimitMiddleware } from './middleware/auth-rate-limit.middleware';
 
@@ -16,7 +23,7 @@ import { AuthRateLimitMiddleware } from './middleware/auth-rate-limit.middleware
   imports: [
     CacheModule.register(),
     ConfigModule,
-    TypeOrmModule.forFeature([User]),
+    TypeOrmModule.forFeature([User, Session]),
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -44,9 +51,10 @@ import { AuthRateLimitMiddleware } from './middleware/auth-rate-limit.middleware
     AuthService,
     JwtManagementService,
     TwoFactorService,
+    SessionsService,
     AuthRateLimitMiddleware,
   ],
-  exports: [AuthService, JwtModule, JwtManagementService, TwoFactorService],
+  exports: [AuthService, JwtModule, JwtManagementService, TwoFactorService, SessionsService],
 })
 export class AuthModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
@@ -55,6 +63,7 @@ export class AuthModule implements NestModule {
       .forRoutes(
         { path: 'auth/login', method: RequestMethod.POST },
         { path: 'auth/register', method: RequestMethod.POST },
+        { path: 'auth/2fa/verify', method: RequestMethod.POST },
       );
   }
 }

@@ -1,6 +1,9 @@
 import {
   Controller,
   Post,
+  Get,
+  Delete,
+  Param,
   Body,
   HttpCode,
   HttpStatus,
@@ -20,6 +23,7 @@ import { LogoutResponseDto } from './dto/logout-response.dto';
 import { TwoFactorEnableDto } from './dto/two-factor-enable.dto';
 import { TwoFactorVerifyDto } from './dto/two-factor-verify.dto';
 import { TwoFactorTokenDto } from './dto/two-factor-token.dto';
+import { SessionResponseDto } from './dto/session-response.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { Public } from '../../common/decorators/public.decorator';
 import { RateLimit } from '../security/decorators/rate-limit.decorator';
@@ -49,10 +53,19 @@ export class AuthController {
   async login(
     @Body() loginDto: LoginDto,
     @Res({ passthrough: true }) res: Response,
-  ): Promise<Omit<AuthResponseDto, 'refreshToken'> & { requires2FA?: boolean; preAuthToken?: string }> {
+  ): Promise<
+    Omit<AuthResponseDto, 'refreshToken'> & {
+      requires2FA?: boolean;
+      preAuthToken?: string;
+    }
+  > {
     const result = await this.authService.login(loginDto);
     if (!result.requires2FA && result.refreshToken) {
-      res.cookie(REFRESH_COOKIE, result.refreshToken, refreshCookieOptions(this.isProduction));
+      res.cookie(
+        REFRESH_COOKIE,
+        result.refreshToken,
+        refreshCookieOptions(this.isProduction),
+      );
     }
     const { refreshToken: _, ...response } = result;
     return response;
@@ -68,7 +81,11 @@ export class AuthController {
   ): Promise<Omit<AuthResponseDto, 'refreshToken'>> {
     const result = await this.authService.register(registerDto);
     if (result.refreshToken) {
-      res.cookie(REFRESH_COOKIE, result.refreshToken, refreshCookieOptions(this.isProduction));
+      res.cookie(
+        REFRESH_COOKIE,
+        result.refreshToken,
+        refreshCookieOptions(this.isProduction),
+      );
     }
     const { refreshToken: _, ...response } = result;
     return response;
@@ -99,9 +116,36 @@ export class AuthController {
       throw new UnauthorizedException('No refresh token');
     }
     const result = await this.authService.refreshTokens(refreshToken);
-    res.cookie(REFRESH_COOKIE, result.refreshToken, refreshCookieOptions(this.isProduction));
+    res.cookie(
+      REFRESH_COOKIE,
+      result.refreshToken,
+      refreshCookieOptions(this.isProduction),
+    );
     const { refreshToken: _, ...response } = result;
     return response;
+  }
+
+  // ──────────────────────────── Session endpoints ────────────────────────────
+
+  @Get('sessions')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async listSessions(@Req() req): Promise<SessionResponseDto[]> {
+    return this.authService.listSessions(req.user);
+  }
+
+  @Delete('sessions/:id')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async revokeSession(@Req() req, @Param('id') id: string): Promise<void> {
+    return this.authService.revokeSession(req.user, id);
+  }
+
+  @Delete('sessions')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async revokeAllSessions(@Req() req): Promise<void> {
+    return this.authService.revokeAllSessions(req.user);
   }
 
   // ──────────────────────────── 2FA endpoints ────────────────────────────
@@ -131,15 +175,23 @@ export class AuthController {
   }
 
   @Post('2fa/verify')
+  @RateLimit({ limit: 5, windowMs: 60_000, keyBy: 'ip' })
   @Public()
   @HttpCode(HttpStatus.OK)
   async verify2fa(
     @Body() dto: TwoFactorVerifyDto,
     @Res({ passthrough: true }) res: Response,
   ): Promise<Omit<AuthResponseDto, 'refreshToken'>> {
-    const result = await this.authService.verifyTwoFactor(dto.preAuthToken, dto.token);
+    const result = await this.authService.verifyTwoFactor(
+      dto.preAuthToken,
+      dto.token,
+    );
     if (result.refreshToken) {
-      res.cookie(REFRESH_COOKIE, result.refreshToken, refreshCookieOptions(this.isProduction));
+      res.cookie(
+        REFRESH_COOKIE,
+        result.refreshToken,
+        refreshCookieOptions(this.isProduction),
+      );
     }
     const { refreshToken: _, ...response } = result;
     return response;
